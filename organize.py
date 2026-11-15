@@ -14,6 +14,12 @@ RULES = {
     ".png": "图片",
     ".mp4": "视频",
     ".zip": "压缩包",
+    ".mp3": "音频",
+    ".txt": "文本文件",
+    ".webp": "图片"
+
+
+
 }
 
 def organize(folder):
