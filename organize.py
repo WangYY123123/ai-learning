@@ -17,9 +17,6 @@ RULES = {
     ".mp3": "音频",
     ".txt": "文本文件",
     ".webp": "图片"
-
-
-
 }
 
 def organize(folder):
