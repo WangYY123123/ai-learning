@@ -12,7 +12,6 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-OLLAMA = "http://localhost:11434/api/embed"
 MODEL = "bge-m3"
 TOPK = 3
 SYSTEM = (
@@ -38,13 +37,17 @@ def get_env(name):
 
 
 def embed(text):
+    # Ollama 地址走环境变量：本机跑默认 localhost；
+    # 进容器后 localhost 是容器自己，要改指宿主机（compose 里会设 OLLAMA_URL）
+    base = get_env("OLLAMA_URL") or "http://localhost:11434"
     body = json.dumps({"model": MODEL, "input": text}).encode()
     req = urllib.request.Request(
-        OLLAMA, data=body, headers={"Content-Type": "application/json"}
+        base + "/api/embed", data=body, headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
     return data["embeddings"][0]
+
 
 
 def get_conn():
