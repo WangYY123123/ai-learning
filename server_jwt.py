@@ -17,7 +17,9 @@ app = FastAPI()
 
 
 def get_env(name):
-    """从 .env 里按名字读配置（同阶段2的通用读法）。"""
+    """读配置：先查环境变量（Docker／服务器运行时注入），没有再查 .env 文件（本地开发用）。"""
+    if name in os.environ:
+        return os.environ[name]
     with open(".env", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
