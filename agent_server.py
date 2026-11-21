@@ -305,7 +305,9 @@ TOOL_FUNCS = {
     "search_memory": tool_search_memory,
     "now": tool_now,
     "calc": tool_calc,
+    "search_docs": tool_search_docs,
 }
+
 
 
 TOOLS = [
