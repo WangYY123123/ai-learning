@@ -23,7 +23,9 @@ SYSTEM = (
     "你是一个运行在用户本地电脑上的私人智能助理。"
     "回答简洁、准确；不知道的事情就直说不知道，不要编造。"
     "需要确认用户以前说过的话时，用 search_memory 工具查档案原文，不要凭印象编。"
-    "用户问日语语法条目的意思或用法时，用 search_docs 工具查知识库原文。"
+    "用户问日语语法，或问起他的文档、备忘、资料里写过的事（费用、安排、说明等）时，"
+"用 search_docs 工具查知识库原文；只有问以前在对话里说过什么，才用 search_memory。"
+
 
 
 )
@@ -283,15 +285,19 @@ def tool_calc(expression):
         return f"算不了「{expression}」：{e}"
 
 def tool_search_docs(query):
-    """按语义在文档知识库（日语语法库 jp_chunks）里检索，返回最相关的 3 条原文。
-    与 search_memory 的区别：那件是关键词搜对话档案，这件是向量搜文档——语义相近就能命中。"""
+    """按语义在文档知识库里检索（语法库 jp_chunks＋自有文档 docs_chunks），返回最相关的 3 条。
+    与 search_memory 的区别：那件是关键词搜对话档案，这件是向量搜文档——语义相近就能命中。
+    自有文档的每条都带【来源：文件名】前缀，回答时能说清出处。"""
     try:
         vec = embed(query)
         vec_str = "[" + ",".join(str(x) for x in vec) + "]"
         with db_conn() as conn:
             rows = conn.execute(
-                "SELECT content FROM jp_chunks "
-                "ORDER BY embedding <=> %s::vector LIMIT 3",
+                "SELECT content FROM ("
+                "  SELECT content, embedding FROM jp_chunks"
+                "  UNION ALL"
+                "  SELECT '【来源：' || source || '】' || content, embedding FROM docs_chunks"
+                ") AS all_docs ORDER BY embedding <=> %s::vector LIMIT 3",
                 (vec_str,),
             ).fetchall()
     except Exception as e:
@@ -299,6 +305,8 @@ def tool_search_docs(query):
     if not rows:
         return "知识库里没有找到相关内容。"
     return "\n\n".join(r[0] for r in rows)
+
+
 
 
 TOOL_FUNCS = {
@@ -346,7 +354,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_docs",
-            "description": "按语义在文档知识库里检索原文（当前库为日语 N2 语法库）。当用户问某个语法条目的意思、用法、接续或例句时调用。",
+            "按语义在文档知识库里检索原文（日语 N2 语法库＋用户自有文档）。当用户问语法条目的意思用法，或问起他文档里写过的事时调用。": "按语义在文档知识库里检索原文（当前库为日语 N2 语法库）。当用户问某个语法条目的意思、用法、接续或例句时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
