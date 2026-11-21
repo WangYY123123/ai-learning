@@ -43,11 +43,15 @@ def health():
 @app.post("/chat")
 def chat(body: ChatIn):
     history = sessions.setdefault(body.session_id, [])
+# 长期记忆检索：先翻档案，把相关旧对话垫进系统提示
+    memory_text = recall_memory(body.message)
+    system_content = SYSTEM + ("\n\n" + memory_text if memory_text else "")
     messages = (
-        [{"role": "system", "content": SYSTEM}]
-        + history
-        + [{"role": "user", "content": body.message}]
-    )
+    [{"role": "system", "content": system_content}]
+    + history
+    + [{"role": "user", "content": body.message}]
+)
+
     resp = requests.post(
         OLLAMA_CHAT,
         json={"model": MODEL, "messages": messages, "stream": False},
@@ -249,3 +253,24 @@ try:
     print("[memory] 记忆表就绪", flush=True)
 except Exception as e:
     print(f"[memory] 记忆库连不上，存档功能停用：{e}", flush=True)
+def recall_memory(question, k=3):
+    """按向量距离从 agent_memory 捞最相关的 k 条旧问答，拼成一段可垫进提示词的文本。
+    全局检索（不分 session）——长期记忆本来就是跨会话的；失败或无结果都返回空串。"""
+    try:
+        vec = embed(question)
+        vec_str = "[" + ",".join(str(x) for x in vec) + "]"
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT question, answer FROM agent_memory "
+                "ORDER BY embedding <=> %s::vector LIMIT %s",
+                (vec_str, k),
+            ).fetchall()
+    except Exception as e:
+        print(f"[memory] 检索失败（不影响回答）：{e}", flush=True)
+        return ""
+    if not rows:
+        return ""
+    lines = ["以下是从长期记忆中检索到的相关旧对话，供参考："]
+    for q, a in rows:
+        lines.append(f"- 问：{q} 答：{a}")
+    return "\n".join(lines)
