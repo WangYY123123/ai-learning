@@ -2,6 +2,11 @@
 # 骨架沿用 server_chat.py（会话记忆），大脑换成本地 Ollama 的 Qwen。
 # 印证手册第 41 节：换大脑不用换身体——变的只有地址、模型名和回包的取法。
 import json
+import os
+import time
+
+import psycopg
+
 from pyexpat.errors import messages
 
 import requests
@@ -55,6 +60,9 @@ def chat(body: ChatIn):
     history.append({"role": "user", "content": body.message})
     history.append({"role": "assistant", "content": answer})
     del history[:-MAX_TURNS * 2]
+    # 长期记忆存档（支线，失败不影响回答）
+    save_memory(body.session_id, body.message, answer)
+
 
     # 回包把中文转义成 \uXXXX 纯 ASCII 再发：PowerShell 5.1 等老客户端
     # 按错误编码解 UTF-8 原文会乱码，转义后任何客户端都能无损还原。
@@ -165,3 +173,79 @@ def oai_chat(body: OAIChatIn):
         content=json.dumps(payload, ensure_ascii=True),
         media_type="application/json",
     )
+# ===== 长期记忆 · 存档（二期第 1 步）=====
+# 每轮 /chat 问答后，把问答原文＋向量存进 PostgreSQL，攒长期记忆的原料。
+# 连接参数与日语语法系统同一套（localhost:5433 / postgres / PGVEC_PASSWORD）。
+# 存档是支线：失败只打日志，绝不拖垮回答。
+
+OLLAMA_EMBED = "http://localhost:11434/api/embed"
+EMBED_MODEL = "bge-m3"
+
+
+def get_env(name):
+    if name in os.environ:
+        return os.environ[name]
+    try:
+        with open(".env", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def db_conn():
+    return psycopg.connect(
+        host="localhost",
+        port=5433,
+        dbname="postgres",
+        user="postgres",
+        password=get_env("PGVEC_PASSWORD"),
+        connect_timeout=5,
+
+    )
+
+
+def embed(text):
+    resp = requests.post(
+        OLLAMA_EMBED, json={"model": EMBED_MODEL, "input": text}, timeout=120
+    )
+    resp.raise_for_status()
+    return resp.json()["embeddings"][0]
+
+
+def init_memory():
+    with db_conn() as conn:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_memory ("
+            "id SERIAL PRIMARY KEY, "
+            "session_id TEXT, "
+            "question TEXT, "
+            "answer TEXT, "
+            "embedding vector(1024), "
+            "created_at TIMESTAMPTZ DEFAULT now())"
+        )
+
+
+def save_memory(session_id, question, answer):
+    try:
+        text = f"问：{question}\n答：{answer}"
+        vec = embed(text)
+        vec_str = "[" + ",".join(str(x) for x in vec) + "]"
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO agent_memory (session_id, question, answer, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (session_id, question, answer, vec_str),
+            )
+    except Exception as e:
+        print(f"[memory] 存档失败（不影响回答）：{e}", flush=True)
+
+
+try:
+    init_memory()
+    print("[memory] 记忆表就绪", flush=True)
+except Exception as e:
+    print(f"[memory] 记忆库连不上，存档功能停用：{e}", flush=True)
