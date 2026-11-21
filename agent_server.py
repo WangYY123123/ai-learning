@@ -242,7 +242,35 @@ def tool_search_memory(keyword):
     return "\n".join(lines)
 
 
-TOOL_FUNCS = {"search_memory": tool_search_memory}
+def tool_now(detail=""):
+    """返回当前日期时间（本机时区）。模型天生不知道现在几点，靠这件工具。
+    detail 参数只是占位（无参数工具调用容易被模型写坏格式），忽略不用。"""
+
+    from datetime import datetime
+
+    now = datetime.now()
+    weekdays = "一二三四五六日"
+    return now.strftime("%Y-%m-%d %H:%M:%S") + f" 星期{weekdays[now.weekday()]}"
+
+
+def tool_calc(expression):
+    """安全计算一个四则运算表达式。先过字符白名单，绝不直接 eval 模型给的原文。"""
+    import re
+
+    if len(expression) > 100 or not re.fullmatch(r"[0-9+\-*/%.() ]+", expression):
+        return "表达式不合规：只允许数字与 + - * / % ** 和括号，长度不超过 100。"
+    try:
+        return str(eval(expression, {"__builtins__": {}}, {}))
+    except Exception as e:
+        return f"算不了「{expression}」：{e}"
+
+
+TOOL_FUNCS = {
+    "search_memory": tool_search_memory,
+    "now": tool_now,
+    "calc": tool_calc,
+}
+
 
 TOOLS = [
     {
@@ -251,18 +279,42 @@ TOOLS = [
             "name": "search_memory",
             "description": "按关键词在长期记忆档案里搜索以前的对话原文。当用户问起以前聊过的事、或需要确认用户说过的话时调用。",
             "parameters": {
+    "type": "object",
+    "properties": {
+        "detail": {"type": "string", "description": "占位参数，可留空"}
+    },
+    "required": [],
+},
+
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "now",
+            "description": "获取当前日期和时间（含星期）。当用户问现在几点、今天几号，或任何需要知道当前时间的问题时调用。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calc",
+            "description": "计算一个数学表达式并返回精确结果。当用户要求算账、算价格、做四则运算时调用，不要自己心算。",
+            "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {
+                    "expression": {
                         "type": "string",
-                        "description": "要搜索的关键词，如人名、店名、数字相关的词",
+                        "description": "要计算的表达式，如 (250000-13200)*12 或 3980*1.1",
                     }
                 },
-                "required": ["keyword"],
+                "required": ["expression"],
             },
         },
-    }
+    },
 ]
+
 
 
 # ===== 长期记忆 · 存档（二期第 1 步）=====
