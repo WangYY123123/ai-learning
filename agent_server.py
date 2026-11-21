@@ -22,6 +22,8 @@ MAX_TURNS = 6  # 每个会话最多保留最近 6 轮，防上下文无限膨胀
 SYSTEM = (
     "你是一个运行在用户本地电脑上的私人智能助理。"
     "回答简洁、准确；不知道的事情就直说不知道，不要编造。"
+    "需要确认用户以前说过的话时，用 search_memory 工具查档案原文，不要凭印象编。"
+
 )
 
 app = FastAPI()
@@ -43,38 +45,55 @@ def health():
 @app.post("/chat")
 def chat(body: ChatIn):
     history = sessions.setdefault(body.session_id, [])
-# 长期记忆检索：先翻档案，把相关旧对话垫进系统提示
+    # 长期记忆检索：先翻档案，把相关旧对话垫进系统提示
     memory_text = recall_memory(body.message)
     system_content = SYSTEM + ("\n\n" + memory_text if memory_text else "")
     messages = (
-    [{"role": "system", "content": system_content}]
-    + history
-    + [{"role": "user", "content": body.message}]
-)
-
-    resp = requests.post(
-        OLLAMA_CHAT,
-        json={"model": MODEL, "messages": messages, "stream": False},
-        timeout=300,
+        [{"role": "system", "content": system_content}]
+        + history
+        + [{"role": "user", "content": body.message}]
     )
-    resp.raise_for_status()
-    answer = resp.json()["message"]["content"]
+    # 工具调用循环：模型说要调工具就执行、把结果喂回去，直到它给出最终回答（最多 5 轮）
+    answer = ""
+    for _ in range(5):
+        resp = requests.post(
+            OLLAMA_CHAT,
+            json={"model": MODEL, "messages": messages, "tools": TOOLS, "stream": False},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        msg = resp.json()["message"]
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            answer = msg.get("content", "")
+            break
+        messages.append(msg)
+        for call in calls:
+            fn = call["function"]["name"]
+            args = call["function"].get("arguments", {})
+            func = TOOL_FUNCS.get(fn)
+            result = func(**args) if func else f"没有名为 {fn} 的工具"
+            print(f"[tool] {fn}({args})", flush=True)
+            messages.append({"role": "tool", "content": result})
+    if not answer:
+        answer = "（工具调用轮数用尽，没能得出回答）"
 
     # 把这一轮干净问答存进记忆，并裁掉太老的轮次
     history.append({"role": "user", "content": body.message})
     history.append({"role": "assistant", "content": answer})
     del history[:-MAX_TURNS * 2]
+
     # 长期记忆存档（支线，失败不影响回答）
     save_memory(body.session_id, body.message, answer)
-
 
     # 回包把中文转义成 \uXXXX 纯 ASCII 再发：PowerShell 5.1 等老客户端
     # 按错误编码解 UTF-8 原文会乱码，转义后任何客户端都能无损还原。
     payload = {"answer": answer, "history_turns": len(history) // 2}
     return Response(
-    content=json.dumps(payload, ensure_ascii=True),
-    media_type="application/json",
+        content=json.dumps(payload, ensure_ascii=True),
+        media_type="application/json",
     )
+
     # ===== OpenAI 兼容层 =====
     # 让生态里的现成界面（如 Open WebUI）把本服务当成 OpenAI 来用。
     # 与 /chat 的区别：这里服务端不记会话，历史由客户端每次全量带来——这是 OpenAI 协议的约定。
@@ -198,6 +217,54 @@ def oai_chat(body: OAIChatIn):
         content=json.dumps(payload, ensure_ascii=True),
         media_type="application/json",
     )
+# ===== 工具层（三期第 1 步）=====
+# 工具 = 普通 Python 函数 + 一张给模型看的说明书（TOOLS）。
+# 模型只负责"决定调哪个、传什么参数"，真正干活的是函数——工具长在服务里，不长在模型里。
+
+
+def tool_search_memory(keyword):
+    """按关键词在 agent_memory 里做文本搜索，返回命中的旧问答原文（近的在前，最多 5 条）。"""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT question, answer FROM agent_memory "
+                "WHERE question ILIKE %s OR answer ILIKE %s "
+                "ORDER BY id DESC LIMIT 5",
+                (f"%{keyword}%", f"%{keyword}%"),
+            ).fetchall()
+    except Exception as e:
+        return f"搜索记忆失败：{e}"
+    if not rows:
+        return f"档案里没有找到包含「{keyword}」的旧对话。"
+    lines = [f"找到 {len(rows)} 条包含「{keyword}」的旧对话："]
+    for q, a in rows:
+        lines.append(f"- 问：{q} 答：{a}")
+    return "\n".join(lines)
+
+
+TOOL_FUNCS = {"search_memory": tool_search_memory}
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "按关键词在长期记忆档案里搜索以前的对话原文。当用户问起以前聊过的事、或需要确认用户说过的话时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "要搜索的关键词，如人名、店名、数字相关的词",
+                    }
+                },
+                "required": ["keyword"],
+            },
+        },
+    }
+]
+
+
 # ===== 长期记忆 · 存档（二期第 1 步）=====
 # 每轮 /chat 问答后，把问答原文＋向量存进 PostgreSQL，攒长期记忆的原料。
 # 连接参数与日语语法系统同一套（localhost:5433 / postgres / PGVEC_PASSWORD）。
