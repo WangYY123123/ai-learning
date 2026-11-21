@@ -103,14 +103,15 @@ def _oai_chunk(content=None, finish=None):
 
 
 def _stream_oai(messages):
-        # 把 Ollama 的流（NDJSON，一行一块）逐块翻译成 OpenAI 的流（SSE，一块一条 data:）
-        with requests.post(
+    # 把 Ollama 的流（NDJSON，一行一块）逐块翻译成 OpenAI 的流（SSE，一块一条 data:）
+    # think=False：关掉思考区，正文直接进 content，流式客户端不会收到长段空块。
+    with requests.post(
         OLLAMA_CHAT,
-        json={"model": MODEL, "messages": messages, "stream": True},
+        json={"model": MODEL, "messages": messages, "stream": True, "think": False},
         stream=True,
         timeout=300,
     ) as resp:
-            resp.raise_for_status()
+        resp.raise_for_status()
         for line in resp.iter_lines():
             if not line:
                 continue
@@ -122,7 +123,9 @@ def _stream_oai(messages):
             if part.get("done"):
                 end = _oai_chunk(finish="stop")
                 yield "data: " + json.dumps(end, ensure_ascii=True) + "\n\n"
-        yield "data: [DONE]\n\n"
+    yield "data: [DONE]\n\n"
+
+
 
 
 @app.post("/v1/chat/completions")
