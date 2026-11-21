@@ -23,6 +23,8 @@ SYSTEM = (
     "你是一个运行在用户本地电脑上的私人智能助理。"
     "回答简洁、准确；不知道的事情就直说不知道，不要编造。"
     "需要确认用户以前说过的话时，用 search_memory 工具查档案原文，不要凭印象编。"
+    "用户问日语语法条目的意思或用法时，用 search_docs 工具查知识库原文。"
+
 
 )
 
@@ -280,6 +282,24 @@ def tool_calc(expression):
     except Exception as e:
         return f"算不了「{expression}」：{e}"
 
+def tool_search_docs(query):
+    """按语义在文档知识库（日语语法库 jp_chunks）里检索，返回最相关的 3 条原文。
+    与 search_memory 的区别：那件是关键词搜对话档案，这件是向量搜文档——语义相近就能命中。"""
+    try:
+        vec = embed(query)
+        vec_str = "[" + ",".join(str(x) for x in vec) + "]"
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT content FROM jp_chunks "
+                "ORDER BY embedding <=> %s::vector LIMIT 3",
+                (vec_str,),
+            ).fetchall()
+    except Exception as e:
+        return f"搜索知识库失败：{e}"
+    if not rows:
+        return "知识库里没有找到相关内容。"
+    return "\n\n".join(r[0] for r in rows)
+
 
 TOOL_FUNCS = {
     "search_memory": tool_search_memory,
@@ -295,13 +315,15 @@ TOOLS = [
             "name": "search_memory",
             "description": "按关键词在长期记忆档案里搜索以前的对话原文。当用户问起以前聊过的事、或需要确认用户说过的话时调用。",
             "parameters": {
-    "type": "object",
-    "properties": {
-        "detail": {"type": "string", "description": "占位参数，可留空"}
-    },
-    "required": [],
-},
-
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "要搜索的关键词，如人名、店名、数字相关的词",
+                    }
+                },
+                "required": ["keyword"],
+            },
         },
     },
     {
@@ -309,7 +331,30 @@ TOOLS = [
         "function": {
             "name": "now",
             "description": "获取当前日期和时间（含星期）。当用户问现在几点、今天几号，或任何需要知道当前时间的问题时调用。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "detail": {"type": "string", "description": "占位参数，可留空"}
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": "按语义在文档知识库里检索原文（当前库为日语 N2 语法库）。当用户问某个语法条目的意思、用法、接续或例句时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "要检索的问题或条目，如「ざるを得ない 的意思」",
+                    }
+                },
+                "required": ["query"],
+            },
         },
     },
     {
@@ -330,6 +375,7 @@ TOOLS = [
         },
     },
 ]
+
 def _call_tool(fn, args):
     """执行一次工具调用（带装甲）：模型传参不可信——先过滤掉函数不认识的参数，
     执行出错也不许炸请求，转成文字喂回给模型，让它自己改口重问。"""
