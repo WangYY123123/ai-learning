@@ -71,8 +71,8 @@ def chat(body: ChatIn):
         for call in calls:
             fn = call["function"]["name"]
             args = call["function"].get("arguments", {})
-            func = TOOL_FUNCS.get(fn)
-            result = func(**args) if func else f"没有名为 {fn} 的工具"
+            result = _call_tool(fn, args)
+
             print(f"[tool] {fn}({args})", flush=True)
             messages.append({"role": "tool", "content": result})
     if not answer:
@@ -133,32 +133,50 @@ def _oai_chunk(content=None, finish=None):
     }
 
 
-def _stream_oai(messages, question=""):
-    # 把 Ollama 的流（NDJSON，一行一块）逐块翻译成 OpenAI 的流（SSE，一块一条 data:）
-    # think=False：关掉思考区，正文直接进 content，流式客户端不会收到长段空块。
-    parts = []
-    with requests.post(
-        OLLAMA_CHAT,
-        json={"model": MODEL, "messages": messages, "stream": True, "think": False},
-        stream=True,
-        timeout=300,
-    ) as resp:
+def _run_tools(messages):
+    """工具轮（非流式）：模型要调工具就执行、把结果喂回，直到它给出最终回答。
+    返回 (messages, answer, last_data)；answer 为空串表示轮数用尽仍未答。
+    与 /chat 的循环同构——那边内联，这边抽成函数给 /v1 的两个分支共用。"""
+    last_data = {}
+    for _ in range(5):
+        resp = requests.post(
+            OLLAMA_CHAT,
+            json={"model": MODEL, "messages": messages, "tools": TOOLS, "stream": False},
+            timeout=300,
+        )
         resp.raise_for_status()
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            part = json.loads(line)
-            text = part.get("message", {}).get("content", "")
-            if text:
-                parts.append(text)
-                chunk = _oai_chunk(content=text)
-                yield "data: " + json.dumps(chunk, ensure_ascii=True) + "\n\n"
-            if part.get("done"):
-                end = _oai_chunk(finish="stop")
-                yield "data: " + json.dumps(end, ensure_ascii=True) + "\n\n"
-    # 流结束：把完整问答存进长期记忆（网页版通道记为 webui）
-    if question and parts:
-        save_memory("webui", question, "".join(parts))
+        last_data = resp.json()
+        msg = last_data["message"]
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            return messages, msg.get("content", ""), last_data
+        messages.append(msg)
+        for call in calls:
+            fn = call["function"]["name"]
+            args = call["function"].get("arguments", {})
+            result = _call_tool(fn, args)
+
+            print(f"[tool] {fn}({args})", flush=True)
+            messages.append({"role": "tool", "content": result})
+    return messages, "", last_data
+
+
+def _stream_answer(answer, question=""):
+    """把已生成的完整回答切成小块按 SSE 吐出（网页版流式通道用），吐完存档。
+    两段式：工具轮先非流式跑完，最终答再切片成流——网页上仍是逐字出现的效果。"""
+    step = 12
+    for i in range(0, len(answer), step):
+        chunk = _oai_chunk(content=answer[i : i + step])
+        yield "data: " + json.dumps(chunk, ensure_ascii=True) + "\n\n"
+    end = _oai_chunk(finish="stop")
+    yield "data: " + json.dumps(end, ensure_ascii=True) + "\n\n"
+    if question and answer:
+        save_memory("webui", question, answer)
+    yield "data: [DONE]\n\n"
+
+    if question and answer:
+        save_memory("webui", question, answer)
+
     yield "data: [DONE]\n\n"
 
 
@@ -180,22 +198,19 @@ def oai_chat(body: OAIChatIn):
     messages = [{"role": "system", "content": system_content}] + [
         {"role": m.role, "content": m.content} for m in body.messages
     ]
+    # 先跑工具轮：该查查、该算算，拿到最终回答再往外发（流式与非流式共用）
+    messages, answer, data = _run_tools(messages)
+    if not answer:
+     answer = "（工具调用轮数用尽，没能得出回答）"
     if body.stream:
-        return StreamingResponse(
-            _stream_oai(messages, question), media_type="text/event-stream"
-        )
-
-        resp = requests.post(
-        OLLAMA_CHAT,
-        json={"model": MODEL, "messages": messages, "stream": False},
-        timeout=300,
+       return StreamingResponse(
+        _stream_answer(answer, question), media_type="text/event-stream"
     )
-        resp.raise_for_status()
-        data = resp.json()
-        if question:
-         save_memory("webui", question, data["message"]["content"])
+    if question:
+     save_memory("webui", question, answer)
 
-        payload = {
+
+    payload = {
         "id": "chatcmpl-local",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -203,7 +218,8 @@ def oai_chat(body: OAIChatIn):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": data["message"]["content"]},
+                "message": {"role": "assistant", "content": answer},
+
                 "finish_reason": "stop",
             }
         ],
@@ -213,7 +229,7 @@ def oai_chat(body: OAIChatIn):
             "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
         },
     }
-        return Response(
+    return Response(
         content=json.dumps(payload, ensure_ascii=True),
         media_type="application/json",
     )
@@ -314,6 +330,23 @@ TOOLS = [
         },
     },
 ]
+def _call_tool(fn, args):
+    """执行一次工具调用（带装甲）：模型传参不可信——先过滤掉函数不认识的参数，
+    执行出错也不许炸请求，转成文字喂回给模型，让它自己改口重问。"""
+    import inspect
+
+    func = TOOL_FUNCS.get(fn)
+    if func is None:
+        return f"没有名为 {fn} 的工具"
+    if not isinstance(args, dict):
+        args = {}
+    allowed = set(inspect.signature(func).parameters)
+    clean = {k: v for k, v in args.items() if k in allowed}
+    try:
+        return func(**clean)
+    except Exception as e:
+        return f"工具 {fn} 执行失败：{e}"
+
 
 
 
