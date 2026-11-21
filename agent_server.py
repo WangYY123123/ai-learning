@@ -114,9 +114,10 @@ def _oai_chunk(content=None, finish=None):
     }
 
 
-def _stream_oai(messages):
+def _stream_oai(messages, question=""):
     # 把 Ollama 的流（NDJSON，一行一块）逐块翻译成 OpenAI 的流（SSE，一块一条 data:）
     # think=False：关掉思考区，正文直接进 content，流式客户端不会收到长段空块。
+    parts = []
     with requests.post(
         OLLAMA_CHAT,
         json={"model": MODEL, "messages": messages, "stream": True, "think": False},
@@ -130,32 +131,52 @@ def _stream_oai(messages):
             part = json.loads(line)
             text = part.get("message", {}).get("content", "")
             if text:
+                parts.append(text)
                 chunk = _oai_chunk(content=text)
                 yield "data: " + json.dumps(chunk, ensure_ascii=True) + "\n\n"
             if part.get("done"):
                 end = _oai_chunk(finish="stop")
                 yield "data: " + json.dumps(end, ensure_ascii=True) + "\n\n"
+    # 流结束：把完整问答存进长期记忆（网页版通道记为 webui）
+    if question and parts:
+        save_memory("webui", question, "".join(parts))
     yield "data: [DONE]\n\n"
+
 
 
 
 
 @app.post("/v1/chat/completions")
 def oai_chat(body: OAIChatIn):
+    # 取最后一条用户消息当问题：检索要用、存档也要用
+    question = ""
+    for m in reversed(body.messages):
+        if m.role == "user":
+            question = m.content
+            break
+    # 长期记忆检索：翻档案垫进系统提示（和人设拼在一起）
+    memory_text = recall_memory(question) if question else ""
+    system_content = SYSTEM + ("\n\n" + memory_text if memory_text else "")
     # 不管哪个界面进来，先垫上自己的人设，保证助理性格一致
-            messages = [{"role": "system", "content": SYSTEM}] + [
+    messages = [{"role": "system", "content": system_content}] + [
         {"role": m.role, "content": m.content} for m in body.messages
     ]
-            if body.stream:
-                return StreamingResponse(_stream_oai(messages), media_type="text/event-stream")
-            resp = requests.post(
+    if body.stream:
+        return StreamingResponse(
+            _stream_oai(messages, question), media_type="text/event-stream"
+        )
+
+        resp = requests.post(
         OLLAMA_CHAT,
         json={"model": MODEL, "messages": messages, "stream": False},
         timeout=300,
     )
-            resp.raise_for_status()
-            data = resp.json()
-            payload = {
+        resp.raise_for_status()
+        data = resp.json()
+        if question:
+         save_memory("webui", question, data["message"]["content"])
+
+        payload = {
         "id": "chatcmpl-local",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -173,7 +194,7 @@ def oai_chat(body: OAIChatIn):
             "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
         },
     }
-            return Response(
+        return Response(
         content=json.dumps(payload, ensure_ascii=True),
         media_type="application/json",
     )
